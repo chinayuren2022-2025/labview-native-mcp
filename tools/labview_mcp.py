@@ -25,7 +25,7 @@ from pathlib import Path
 import pythoncom
 import win32com.client
 from mcp.server.fastmcp import FastMCP, Image
-from lvscript import Session, ROOT, cluster_array
+from lvscript import Session, ROOT, cluster_array, LabVIEWError, format_com_error
 
 mcp = FastMCP('LabVIEW Native Scripting')
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='labview-sta')
@@ -34,10 +34,13 @@ _session = None
 
 def _dispatch(operation, args):
     global _session
-    if _session is None:
-        pythoncom.CoInitialize()
-        _session = Session()
-    return encode(operation(_session, *args))
+    try:
+        if _session is None:
+            pythoncom.CoInitialize()
+            _session = Session()
+        return encode(operation(_session, *args))
+    except pythoncom.com_error as exc:
+        raise LabVIEWError(format_com_error(exc, operation.__name__)) from None
 
 
 async def native(operation, *args):
@@ -80,7 +83,7 @@ async def new_vi(path: str) -> dict:
     def create(s):
         p = Path(path).resolve()
         if p.exists():
-            raise FileExistsError(p)
+            raise FileExistsError(f'Cannot create VI: file already exists; existing work was not overwritten: {p}')
         p.parent.mkdir(parents=True, exist_ok=True)
         s.new_vi(p)
         return {'path': str(p), 'diagram': s.diagram(p), 'panel': s.prop_get('VI', 'Panel', s.vi(p))}
@@ -98,6 +101,16 @@ async def open_vi(path: str, show: bool = False) -> dict:
             s.prop_set('VI', 'BDWin.Open', ref, True)
         return {'path': str(p), 'diagram': s.diagram(p), 'panel': s.prop_get('VI', 'Panel', s.vi(p))}
     return await native(open_)
+
+
+@mcp.tool()
+async def search_styles(query: str = '', limit: int = 50, offset: int = 0) -> dict:
+    """Search the installed native style ring by name; empty query lists all styles.
+
+    Returns exact names and numeric IDs for add_object, with paginated matches.
+    Names are case-insensitive for search, but add_object uses exact native names.
+    """
+    return await native(lambda s: s.search_styles(query, limit, offset))
 
 
 @mcp.tool()
@@ -121,12 +134,30 @@ async def find_objects(path: str, object_class: str, panel: bool = False) -> lis
 
 @mcp.tool()
 async def inspect_node(reference: int) -> dict:
-    """Read current node class and terminals. Rediscover after changing configuration."""
+    """Read current class and terminals, including loop i/N/condition references.
+
+    Loop names are semantic labels; native_name preserves LabVIEW's actual name.
+    Rediscover after changing configuration. Does not create optional terminals.
+    """
     def inspect(s):
-        return {'class': s.prop_get('GObject', 'Class Name', reference),
-                'terminals': [{'reference': t, 'name': s.prop_get('Terminal', 'Name', t),
-                               'source': bool(s.prop_get('Terminal', 'Is Source?', t))}
-                              for t in s.prop_get('Node', 'Terminals[]', reference)]}
+        cls = s.prop_get('GObject', 'Class Name', reference)
+        terminals = list(s.prop_get('Node', 'Terminals[]', reference))
+        roles = {}
+        if cls in ('WhileLoop', 'ForLoop'):
+            roles[s.prop_get('Loop', 'LoopCounter', reference)] = ('i', 'iteration')
+            if cls == 'ForLoop':
+                count = s.prop_get('ForLoop', 'LoopCount', reference)
+                roles[s.prop_get('Tunnel', 'Outside Term', count)] = ('N', 'count')
+            if cls == 'WhileLoop' or s.prop_get('ForLoop', 'HasCondTerm', reference):
+                roles[s.prop_get(cls, 'LoopEndRef', reference)] = ('condition', 'condition')
+            terminals.extend(t for t in roles if t and t not in terminals)
+        result = []
+        for t in terminals:
+            native_name = s.prop_get('Terminal', 'Name', t)
+            name, role = roles.get(t, (native_name, 'terminal'))
+            result.append({'reference': t, 'name': name, 'native_name': native_name,
+                           'role': role, 'source': bool(s.prop_get('Terminal', 'Is Source?', t))})
+        return {'class': cls, 'terminals': result}
     return await native(inspect)
 
 
@@ -162,8 +193,13 @@ async def invoke(object_class: str, member: str, reference: int, inputs: dict | 
 
 @mcp.tool()
 async def wire(source: int, destination: int) -> dict:
-    """Connect current terminal references. Source must be an output terminal."""
-    return await native(lambda s: s.method('Terminal', 'Connect Wire', destination, **{'Wire Source': source}))
+    """Connect two terminal references; LabVIEW accepts either argument order.
+
+    source/destination name the endpoints, not enforced signal directions.
+    Native type/direction errors remain errors. Routing creates structure tunnels.
+    """
+    return await native(lambda s: s.method('Terminal', 'Connect Wire', destination,
+                                         **{'Wire Source': source, 'Auto Route? (F)': True}))
 
 
 @mcp.tool()
@@ -178,6 +214,16 @@ async def connector(path: str, pattern: int, assignments: dict[str, int]) -> dic
                     Control=control, **{'Terminal Index': int(index)})
         return {'assigned': True}
     return await native(configure)
+
+
+@mcp.tool()
+async def clean_up_diagram(path: str) -> dict:
+    """Explicitly rearrange objects and reroute wires using native Diagram.CleanUp.
+
+    Requires edit mode. Changes layout, not saved until save_vi; render never cleans.
+    """
+    await native(lambda s: s.method('Diagram', 'CleanUp', s.diagram(path)))
+    return {'cleaned': str(Path(path).resolve()), 'saved': False}
 
 
 @mcp.tool()

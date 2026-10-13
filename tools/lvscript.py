@@ -8,6 +8,7 @@ under work/workers and driven through COM by control name.
 GObject refnums (diagrams, nodes, terminals) cross COM as plain ints and stay valid
 for the lifetime of the LabVIEW session.
 """
+import difflib
 import os
 import re
 import shutil
@@ -17,7 +18,7 @@ from pathlib import Path
 import pythoncom
 import win32com.client
 
-LV = Path(os.environ.get('LABVIEW_HOME', r'C:\Program Files\National Instruments\LabVIEW 2021'))
+LV = None  # resolved below from installation evidence, never through COM
 ROOT = Path(__file__).resolve().parent.parent
 LVS = ROOT / 'work' / 'lvscript'          # patched Erdos Miller LV-Scripting copy
 WORKERS = ROOT / 'work' / 'workers'
@@ -40,16 +41,143 @@ class LabVIEWError(RuntimeError):
     pass
 
 
+def _error_text(value):
+    """Keep Unicode as supplied; preserve undecodable native bytes losslessly."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        # LabVIEW strings use the Windows ANSI code page, not necessarily UTF-8.
+        try:
+            return f'{raw.decode("mbcs", errors="strict")} [native bytes: {raw!r}]'
+        except (UnicodeError, LookupError):
+            return repr(raw)
+    return str(value) if value is not None else ''
+
+
+def format_com_error(error, operation):
+    """Readable, non-lossy pywin32 COM diagnostics, including numeric HRESULTs."""
+    parts = [f'{operation}: COM failure']
+    hresult = getattr(error, 'hresult', None)
+    if isinstance(hresult, int):
+        parts.append(f'HRESULT {hresult} (0x{hresult & 0xFFFFFFFF:08X})')
+    text = getattr(error, 'strerror', None)
+    if text:
+        parts.append(_error_text(text))
+    info = getattr(error, 'excepinfo', None)
+    if isinstance(info, (tuple, list)) and len(info) >= 6:
+        wcode, source, description, help_file, help_context, scode = info[:6]
+        if wcode:
+            parts.append(f'wCode {wcode}')
+        if isinstance(scode, int):
+            parts.append(f'scode {scode} (0x{scode & 0xFFFFFFFF:08X})')
+        if source:
+            parts.append(f'source={_error_text(source)}')
+        if description:
+            parts.append(_error_text(description))
+        if help_file:
+            parts.append(f'help={_error_text(help_file)} (context {help_context})')
+    argerror = getattr(error, 'argerror', None)
+    if argerror is not None:
+        parts.append(f'argument index {argerror}')
+    if len(parts) == 1:
+        parts.append(_error_text(error))
+    return '; '.join(parts)
+
+
+def _installation_missing(home):
+    required = (
+        'LabVIEW.exe',
+        'vi.lib/Utility/traverseref.llb',
+        'vi.lib/Utility/QuickDropSupport/Remove and Rewire Objects_core.vi',
+        'vi.lib/Utility/QuickDropSupport/Wire All Terminals_core.vi',
+        'templates/Frameworks/SubVI.vit',
+    )
+    return [name for name in required if not (home / name).is_file()]
+
+
+def _discover_labview():
+    """Find a Development System using explicit override, registry, or disk evidence."""
+    override = os.environ.get('LABVIEW_HOME')
+    if override:
+        home = Path(os.path.expandvars(override)).expanduser().resolve()
+        missing = _installation_missing(home)
+        if missing:
+            raise LabVIEWError(f'LABVIEW_HOME={home} is not a usable LabVIEW Development System; '
+                               f'missing: {", ".join(missing)}. Point LABVIEW_HOME at its installation directory.')
+        return home
+    candidates = []
+    try:
+        import winreg
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                try:
+                    with winreg.OpenKey(hive, r'SOFTWARE\National Instruments\LabVIEW',
+                                        0, winreg.KEY_READ | view) as root:
+                        for index in range(winreg.QueryInfoKey(root)[0]):
+                            name = winreg.EnumKey(root, index)
+                            if name != 'CurrentVersion' and not re.fullmatch(r'\d+(?:\.\d+)*', name):
+                                continue
+                            try:
+                                with winreg.OpenKey(root, name) as key:
+                                    value = winreg.QueryValueEx(key, 'Path')[0]
+                                if isinstance(value, str) and value:
+                                    candidates.append(Path(os.path.expandvars(value)))
+                            except OSError:
+                                continue
+                except OSError:
+                    continue
+    except ImportError:
+        pass
+    for variable in ('ProgramW6432', 'ProgramFiles', 'ProgramFiles(x86)'):
+        if os.environ.get(variable):
+            base = Path(os.environ[variable]) / 'National Instruments'
+            if base.is_dir():
+                candidates.extend(sorted(base.glob('LabVIEW *'), reverse=True))
+    rejected = []
+    seen = set()
+    for candidate in candidates:
+        home = candidate.resolve()
+        identity = str(home).casefold()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        missing = _installation_missing(home)
+        if not missing:
+            return home
+        rejected.append(f'{home} (missing {", ".join(missing)})')
+    details = '; '.join(rejected) or 'no registered or installed Development System found'
+    raise LabVIEWError('Cannot locate a usable LabVIEW Development System (LabVIEW 2021 supported): '
+                       f'{details}. Install the licensed Development System (not only the Run-Time), '
+                       'then set LABVIEW_HOME to its installation directory. COM automation and '
+                       'VI Scripting must be enabled in LabVIEW.')
+
+
+try:
+    LV = _discover_labview()
+except LabVIEWError:
+    # Importing the tool module must still work when LabVIEW is not installed.
+    pass
+
+
 def _check(err, what):
-    if isinstance(err, tuple) and len(err) == 3 and err[0]:
-        raise LabVIEWError(f'{what}: error {err[1]}: {err[2]}')
+    if isinstance(err, (tuple, list)) and len(err) == 3 and err[0]:
+        code = int(err[1])
+        source = _error_text(err[2]).strip()
+        raise LabVIEWError(f'{what}: LabVIEW error {code} (0x{code & 0xFFFFFFFF:08X}); '
+                           f'source: {source or "<empty native error source>"}')
 
 
 class Session:
     def __init__(self):
-        self.app = win32com.client.dynamic.Dispatch('LabVIEW.Application')._oleobj_
+        global LV
+        LV = _discover_labview()
+        try:
+            self.app = win32com.client.dynamic.Dispatch('LabVIEW.Application')._oleobj_
+        except pythoncom.com_error as error:
+            raise LabVIEWError(format_com_error(error, f'Connect LabVIEW.Application (installation {LV})') +
+                               '; enable COM automation in the licensed LabVIEW Development System') from error
         self._refs = {}           # path -> VI COM ref; holding them keeps edited VIs in memory
         self._workers = {}        # (kind, cls, member, write) -> (path, inputs, outputs)
+        self._styles = None       # Python values only; never cached GObject refs
         WORKERS.mkdir(parents=True, exist_ok=True)
         self._trav = self.vi(LV / 'vi.lib' / 'Utility' / 'traverseref.llb' / 'Traverse for GObjects.vi')
         self._rr = self.vi(LV / 'vi.lib' / 'Utility' / 'QuickDropSupport' / 'Remove and Rewire Objects_core.vi')
@@ -61,15 +189,26 @@ class Session:
     def vi(self, path, fresh=False):
         path = str(Path(path).resolve())
         if fresh or path not in self._refs:
-            self._refs[path] = self.app.Invoke(DISPID_GET_VI_REFERENCE, 0, METHOD, True, path, '', False, 0)
+            try:
+                self._refs[path] = self.app.Invoke(DISPID_GET_VI_REFERENCE, 0, METHOD, True, path, '', False, 0)
+            except pythoncom.com_error as error:
+                raise LabVIEWError(format_com_error(error, f'GetVIReference {path}')) from error
         return self._refs[path]
 
     def _invoke(self, ref, name, *args):
-        return ref.Invoke(ref.GetIDsOfNames(name), 0, METHOD, True, *args)
+        try:
+            return ref.Invoke(ref.GetIDsOfNames(name), 0, METHOD, True, *args)
+        except pythoncom.com_error as error:
+            path = next((path for path, cached in self._refs.items() if cached is ref), '<uncached VI>')
+            raise LabVIEWError(format_com_error(error, f'VI.{name} [{path}]')) from error
 
     def call(self, ref, params):
-        names, values = ref.InvokeTypes(DISPID_CALL, 0, METHOD, (24, 0), ((16396, 3), (16396, 3)),
-                                        list(params), list(params.values()))
+        try:
+            names, values = ref.InvokeTypes(DISPID_CALL, 0, METHOD, (24, 0), ((16396, 3), (16396, 3)),
+                                            list(params), list(params.values()))
+        except pythoncom.com_error as error:
+            path = next((path for path, cached in self._refs.items() if cached is ref), '<uncached VI>')
+            raise LabVIEWError(format_com_error(error, f'VI.Call [{path}] parameters {list(params)}')) from error
         return dict(zip(names, values))
 
     def save(self, path, as_path=None):
@@ -79,9 +218,14 @@ class Session:
         self._invoke(self.vi(path), 'Revert')
 
     def render(self, path, out_dir):
-        """Export front panel (<name>p.png) and block diagram (<name>d.png) images."""
+        """Export into a new directory so previous images cannot masquerade as fresh output.
+
+        The native print routine controls clipping/layout; this does not rearrange,
+        save, revert, or otherwise mutate the target VI to change its appearance.
+        """
         out_dir = Path(out_dir).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = Path(tempfile.mkdtemp(prefix='export_', dir=out_dir))
         stem = Path(path).stem
         self._invoke(self.vi(path), 'PrintVIToHTML', str(out_dir / f'{stem}.html'), False, 4, 0, 24, str(out_dir))
         return {k: out_dir / f'{stem}{k[0]}.png' for k in ('panel', 'diagram')
@@ -167,15 +311,54 @@ class Session:
             self._refs.pop(str(tmp.resolve()), None)
         return path, self.labels(path)
 
+    def _native_styles(self):
+        """Cache native ring values, never its session-sensitive object reference."""
+        if self._styles is None:
+            source = LVS / 'Create Invoke Node.vi'
+            rings = self.find(source, 'RingConstant')
+            if not rings:
+                raise LabVIEWError(f'Native style RingConstant missing in {source}')
+            # The patched creator holds the New VI Object primitive's native ring.
+            rows = self.prop_get('RingConstant', 'Strings And Values[]', rings[0])
+            self._styles = {str(name): int(value) for name, value in rows}
+        return self._styles
+
+    def search_styles(self, query='', limit=50, offset=0):
+        """List native name/ID pairs; substring matches precede fuzzy candidates.
+
+        Pagination is deterministic for the session's native creator ring. Results
+        suggest names only: new_object never silently substitutes a candidate.
+        """
+        if not isinstance(query, str):
+            raise ValueError('query must be a string')
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError('limit must be a positive integer')
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError('offset must be a non-negative integer')
+        styles = self._native_styles()
+        names = sorted(styles, key=lambda name: (name.casefold(), name))
+        needle = query.strip().casefold()
+        if needle:
+            substring = [name for name in names if needle in name.casefold()]
+            fuzzy = []
+            for name in names:
+                if needle in name.casefold():
+                    continue
+                score = difflib.SequenceMatcher(None, needle, name.casefold()).ratio()
+                if score >= 0.6:
+                    fuzzy.append((score, name))
+            fuzzy.sort(key=lambda item: (-item[0], item[1].casefold(), item[1]))
+            names = substring + [name for _, name in fuzzy]
+        return {'total': len(names),
+                'matches': [{'name': name, 'id': styles[name]} for name in names[offset:offset + limit]]}
+
     def _object_worker(self, cls, wired):
         """Keep the primitive's native class constant and U32 style ring intact."""
         key = ('new-object', cls, frozenset(wired))
         if key in self._workers:
             return self._workers[key]
         source = LVS / 'Create Invoke Node.vi'
-        ring = self.find(source, 'RingConstant')[0]
-        styles = {name: int(value) for name, value in
-                  self.prop_get('RingConstant', 'Strings And Values[]', ring)}
+        styles = self._native_styles()
         tag = re.sub(r'[^A-Za-z0-9]+', '_', cls + '_' + '_'.join(sorted(wired)))
         path = WORKERS / f'function_New_VI_Object_native_{tag}.vi'
         if not path.exists():
@@ -240,7 +423,11 @@ class Session:
         if path is None:
             if isinstance(style, str):
                 if style not in styles:
-                    raise LabVIEWError(f'Unknown native VI object style: {style}')
+                    candidates = self.search_styles(style, limit=8)['matches']
+                    choices = ', '.join(f'{item["name"]!r} (ID {item["id"]})' for item in candidates)
+                    raise LabVIEWError(f'Unknown native VI object style: {style!r}; '
+                                       f'candidates: {choices or "none"}. Use search_styles to list native names; '
+                                       'select an exact name or numeric ID explicitly.')
                 style = styles[style]
             if style is None:
                 raise LabVIEWError('Specify a native style or a subVI/control path')

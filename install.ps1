@@ -1,14 +1,11 @@
 param(
   [string]$InstallDir = "$env:LOCALAPPDATA\LabVIEWNativeMCP",
   [string]$Python = "",
-  [string]$LabVIEWHome = "$env:ProgramFiles\National Instruments\LabVIEW 2021",
+  [string]$LabVIEWHome = "$env:LABVIEW_HOME",
   [switch]$SkipProbe
 )
 $ErrorActionPreference = 'Stop'
 if (-not [Environment]::Is64BitOperatingSystem) { throw 'Windows x64 is required.' }
-if (-not (Test-Path (Join-Path $LabVIEWHome 'LabVIEW.exe'))) {
-  throw "LabVIEW Development System not found: $LabVIEWHome. Install licensed LabVIEW and enable VI Scripting first."
-}
 function Invoke-Checked([string]$Executable, [string[]]$Arguments) {
   & $Executable @Arguments
   if ($LASTEXITCODE -ne 0) { throw "Command failed ($LASTEXITCODE): $Executable" }
@@ -28,6 +25,7 @@ if (-not $Python -or -not (Test-Path $Python) -or $Python -match 'WindowsApps') 
   throw 'Python 3.12 x64 not found. Install from python.org, or pass -Python with its actual python.exe path.'
 }
 Invoke-Checked $Python @('-c', 'import sys,struct; assert sys.version_info[:2]==(3,12), "Python 3.12 required"; assert struct.calcsize("P")==8, "64-bit Python required"')
+if ($LabVIEWHome) { $env:LABVIEW_HOME = $LabVIEWHome }
 $source = $PSScriptRoot
 $target = [IO.Path]::GetFullPath($InstallDir)
 if ($source.TrimEnd('\') -eq $target.TrimEnd('\')) { throw 'InstallDir must differ from the source checkout.' }
@@ -41,6 +39,9 @@ $venv = Join-Path $target '.venv'
 if (-not (Test-Path (Join-Path $venv 'Scripts\python.exe'))) { Invoke-Checked $Python @('-m','venv',$venv) }
 $runtime = Join-Path $venv 'Scripts\python.exe'
 Invoke-Checked $runtime @('-m','pip','install','-r',(Join-Path $target 'requirements.txt'))
+$discovery = & $runtime -c 'import sys; sys.path.insert(0, sys.argv[1]); from lvscript import _discover_labview; print(_discover_labview())' (Join-Path $target 'tools')
+if ($LASTEXITCODE -ne 0) { throw 'LabVIEW installation discovery failed; see diagnostics above.' }
+$LabVIEWHome = "$discovery".Trim()
 $env:LABVIEW_HOME = $LabVIEWHome
 if (-not $SkipProbe) { Invoke-Checked $runtime @((Join-Path $target 'tools\install_probe.py')) }
 $config = @{ mcpServers = @{ 'labview-native' = @{

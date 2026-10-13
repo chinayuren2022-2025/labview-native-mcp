@@ -5,4 +5,5 @@ work/workers/
 work/mcp_render/
 work/crc_replica/
 work/lvs_render/
+work/signal_demo_*/
 *.log
