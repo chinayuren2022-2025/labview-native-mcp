@@ -1,23 +1,7 @@
-"""LabVIEW 2021 MCP: native editing, configuration, execution and image export.
+"""LabVIEW native scripting over MCP (stdio). Windows + LabVIEW 2021 Development System.
 
-All COM references stay on one STA thread. Refnums are session-local and must be
-rediscovered after deleting/replacing objects or reverting a VI. Configure nodes
-before discovering their terminals; mode changes can invalidate old terminals.
-
-Launch with Python312/python.exe tools/labview_mcp.py (stdio). Client command must
-use the actual Python installation, not WindowsApps/python.exe. Requires installed
-LabVIEW 2021, pywin32, mcp and the patched work/lvscript library. This service does
-not register itself in an AI client or modify client configuration.
-Verified through an independent MCP client: CRC construction/execution and PNG,
-control direction changes, Build Array resizing, Case frame insertion/editing,
-and PropertyItem.IsWrite transitions. Polymorphic U32->U16 selection and edited
-output execution passed. Express Simulate Signal mapped Amplitude persistence
-passed; regeneration-dependent configuration (signal kind/terminal changes) is
-not implemented or verified by configure_express_parameters.
-The real mcp_boundary.py client also exercises error recovery, overwrite refusal,
-scalar/U8-array/cluster shapes, concurrent requests, and two nested For Loops.
-COM byte SAFEARRAY results are recursively normalized to JSON arrays on the STA.
-These finite cases do not guarantee arbitrary nodes, modes or data types.
+All COM calls run serially on one STA thread. Object references are only valid
+for the current LabVIEW session; rediscover them after delete, replace or revert.
 """
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -27,7 +11,11 @@ import win32com.client
 from mcp.server.fastmcp import FastMCP, Image
 from lvscript import Session, ROOT, cluster_array, LabVIEWError, format_com_error
 
-mcp = FastMCP('LabVIEW Native Scripting')
+mcp = FastMCP('LabVIEW Native Scripting', instructions=(
+    'Build VIs in this order: search_styles -> new_vi/open_vi -> add_object -> configure '
+    '(set_property/invoke) -> inspect_node for fresh terminals -> wire -> clean_up_diagram -> '
+    'save_vi -> run_vi/render_vi. Terminals change when a node is reconfigured, so inspect again. '
+    'Use absolute paths. run_vi executes the VI for real, including any hardware or network I/O.'))
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='labview-sta')
 _session = None
 
@@ -132,15 +120,30 @@ async def find_objects(path: str, object_class: str, panel: bool = False) -> lis
     return await native(lambda s: s.find(path, object_class, target=0 if panel else 1))
 
 
-@mcp.tool()
-async def inspect_node(reference: int) -> dict:
-    """Read current class and terminals, including loop i/N/condition references.
+def _tunnel_roles(s, ref, cls):
+    """Terminals of tunnels/shift registers, which are not Nodes and have no Terminals[]."""
+    def ends(tunnel, outside, inside):
+        roles = {s.prop_get('Tunnel', 'Outside Term', tunnel): (outside, outside)}
+        roles.update({t: (inside, inside) for t in s.prop_get('Tunnel', 'Inside Terminals[]', tunnel)})
+        return roles
+    if cls != 'RightShiftRegister':
+        return ends(ref, 'outside', 'inside')
+    roles = {}
+    for left in s.prop_get('RightShiftRegister', 'Left Registers[]', ref):
+        roles.update(ends(left, 'initial', 'previous'))
+    roles.update(ends(ref, 'final', 'next'))
+    return roles
 
-    Loop names are semantic labels; native_name preserves LabVIEW's actual name.
-    Rediscover after changing configuration. Does not create optional terminals.
-    """
-    def inspect(s):
-        cls = s.prop_get('GObject', 'Class Name', reference)
+
+def _inspect(s, reference):
+    cls = s.prop_get('GObject', 'Class Name', reference)
+    if cls.endswith(('Tunnel', 'ShiftRegister')):
+        roles = _tunnel_roles(s, reference, cls)
+        terminals = list(roles)
+    elif cls.endswith('Constant'):
+        roles = {s.prop_get('Constant', 'Terminal', reference): ('value', 'value')}
+        terminals = list(roles)
+    else:
         terminals = list(s.prop_get('Node', 'Terminals[]', reference))
         roles = {}
         if cls in ('WhileLoop', 'ForLoop'):
@@ -151,14 +154,39 @@ async def inspect_node(reference: int) -> dict:
             if cls == 'WhileLoop' or s.prop_get('ForLoop', 'HasCondTerm', reference):
                 roles[s.prop_get(cls, 'LoopEndRef', reference)] = ('condition', 'condition')
             terminals.extend(t for t in roles if t and t not in terminals)
-        result = []
-        for t in terminals:
-            native_name = s.prop_get('Terminal', 'Name', t)
-            name, role = roles.get(t, (native_name, 'terminal'))
-            result.append({'reference': t, 'name': name, 'native_name': native_name,
-                           'role': role, 'source': bool(s.prop_get('Terminal', 'Is Source?', t))})
-        return {'class': cls, 'terminals': result}
-    return await native(inspect)
+    result = []
+    for t in terminals:
+        native_name = s.prop_get('Terminal', 'Name', t)
+        name, role = roles.get(t, (native_name, 'terminal'))
+        result.append({'reference': t, 'name': name, 'native_name': native_name,
+                       'role': role, 'source': bool(s.prop_get('Terminal', 'Is Source?', t))})
+    return {'class': cls, 'reference': reference, 'terminals': result}
+
+
+@mcp.tool()
+async def inspect_node(reference: int) -> dict:
+    """Read the current class and terminals of a node, constant, loop, tunnel or shift register.
+
+    Loops add semantic i / N / condition terminals. Shift registers (pass the
+    RightShiftRegister ref) return initial / previous / next / final; other tunnels
+    return outside / inside; constants return 'value'. native_name keeps LabVIEW's own terminal name.
+    Inspect again after any reconfiguration; this never creates optional terminals.
+    """
+    return await native(_inspect, reference)
+
+
+@mcp.tool()
+async def add_shift_register(loop: int, y: int = 20) -> dict:
+    """Add a shift register to a For/While loop at y pixels below the loop's top edge.
+
+    Returns the same shape as inspect_node: wire the initial value to 'initial',
+    read 'previous' inside the loop, feed 'next', and read 'final' after the loop.
+    """
+    def add(s):
+        # 'Y Positon' is LabVIEW 2021's own spelling of this parameter.
+        right = s.method('Loop', 'Add Shift Register', loop, **{'Y Positon': y})['Add Shift Register']
+        return _inspect(s, right)
+    return await native(add)
 
 
 @mcp.tool()

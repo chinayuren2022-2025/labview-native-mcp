@@ -1,9 +1,9 @@
 __pycache__/
 *.py[cod]
 .venv/
+*.log
+# generated at runtime
 work/workers/
 work/mcp_render/
-work/crc_replica/
-work/lvs_render/
-work/signal_demo_*/
-*.log
+work/*.vi
+examples/output/

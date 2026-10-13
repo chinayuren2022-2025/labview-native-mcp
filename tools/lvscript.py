@@ -54,33 +54,15 @@ def _error_text(value):
 
 
 def format_com_error(error, operation):
-    """Readable, non-lossy pywin32 COM diagnostics, including numeric HRESULTs."""
-    parts = [f'{operation}: COM failure']
+    """One readable line from a pywin32 com_error: operation, HRESULT and LabVIEW's description."""
+    parts = [operation]
     hresult = getattr(error, 'hresult', None)
     if isinstance(hresult, int):
-        parts.append(f'HRESULT {hresult} (0x{hresult & 0xFFFFFFFF:08X})')
-    text = getattr(error, 'strerror', None)
-    if text:
-        parts.append(_error_text(text))
-    info = getattr(error, 'excepinfo', None)
-    if isinstance(info, (tuple, list)) and len(info) >= 6:
-        wcode, source, description, help_file, help_context, scode = info[:6]
-        if wcode:
-            parts.append(f'wCode {wcode}')
-        if isinstance(scode, int):
-            parts.append(f'scode {scode} (0x{scode & 0xFFFFFFFF:08X})')
-        if source:
-            parts.append(f'source={_error_text(source)}')
-        if description:
-            parts.append(_error_text(description))
-        if help_file:
-            parts.append(f'help={_error_text(help_file)} (context {help_context})')
-    argerror = getattr(error, 'argerror', None)
-    if argerror is not None:
-        parts.append(f'argument index {argerror}')
-    if len(parts) == 1:
-        parts.append(_error_text(error))
-    return '; '.join(parts)
+        parts.append(f'HRESULT 0x{hresult & 0xFFFFFFFF:08X}')
+    info = getattr(error, 'excepinfo', None) or ()
+    description = info[2] if len(info) > 2 and info[2] else getattr(error, 'strerror', None)
+    parts.append(_error_text(description) if description else _error_text(error))
+    return ': '.join(parts)
 
 
 def _installation_missing(home):
@@ -199,17 +181,18 @@ class Session:
         try:
             return ref.Invoke(ref.GetIDsOfNames(name), 0, METHOD, True, *args)
         except pythoncom.com_error as error:
-            path = next((path for path, cached in self._refs.items() if cached is ref), '<uncached VI>')
-            raise LabVIEWError(format_com_error(error, f'VI.{name} [{path}]')) from error
+            raise LabVIEWError(format_com_error(error, f'VI.{name} [{self._path_of(ref)}]')) from error
 
     def call(self, ref, params):
         try:
             names, values = ref.InvokeTypes(DISPID_CALL, 0, METHOD, (24, 0), ((16396, 3), (16396, 3)),
                                             list(params), list(params.values()))
         except pythoncom.com_error as error:
-            path = next((path for path, cached in self._refs.items() if cached is ref), '<uncached VI>')
-            raise LabVIEWError(format_com_error(error, f'VI.Call [{path}] parameters {list(params)}')) from error
+            raise LabVIEWError(format_com_error(error, f'VI.Call [{self._path_of(ref)}]')) from error
         return dict(zip(names, values))
+
+    def _path_of(self, ref):
+        return next((path for path, cached in self._refs.items() if cached is ref), '<uncached VI>')
 
     def save(self, path, as_path=None):
         self._invoke(self.vi(path), 'SaveInstrument', str(Path(as_path or path).resolve()), False, False)
@@ -329,12 +312,8 @@ class Session:
         Pagination is deterministic for the session's native creator ring. Results
         suggest names only: new_object never silently substitutes a candidate.
         """
-        if not isinstance(query, str):
-            raise ValueError('query must be a string')
-        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-            raise ValueError('limit must be a positive integer')
-        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
-            raise ValueError('offset must be a non-negative integer')
+        if limit < 1 or offset < 0:
+            raise ValueError('limit must be >= 1 and offset >= 0')
         styles = self._native_styles()
         names = sorted(styles, key=lambda name: (name.casefold(), name))
         needle = query.strip().casefold()
@@ -538,7 +517,13 @@ class Session:
         inputs = {'reference': ref, **inputs}
         unknown = set(inputs) - set(names)
         if unknown:
-            raise LabVIEWError(f'{cls}.{member}: no parameter {sorted(unknown)}; has {names}')
+            # A wired variant only keeps the requested inputs; report the member's full list.
+            full = self.worker(kind, cls, member, write)[1] if wired is not None else names
+            params = [n for n in full if n not in ('reference', 'reference out', 'error in (no error)', 'error out')]
+            hints = {u: difflib.get_close_matches(u, params, n=1) for u in sorted(unknown - {'reference'})}
+            hint = '; '.join(f'{u!r} -> did you mean {m[0]!r}?' for u, m in hints.items() if m)
+            raise LabVIEWError(f'{cls}.{member}: unknown parameter {sorted(unknown)}; '
+                               f'native parameters: {params}' + (f'; {hint}' if hint else ''))
         outs = [n for n in names if n not in inputs and n != 'error in (no error)' and not n.startswith('reference out')]
         out = self.run(path, inputs, outs)
         _check(out.pop('error out', None), f'{cls}.{member}')
