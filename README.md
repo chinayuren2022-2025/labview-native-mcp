@@ -6,11 +6,18 @@ Windows / LabVIEW 2021 的原生 VI Scripting MCP 服务。Python COM 调用 Lab
 
 需要 Windows x64、合法安装的 LabVIEW 2021 x64 Development System（启用 VI Scripting）、Python 3.12 x64。LabVIEW Runtime Engine 不够。本仓库不包含 NI 软件、帮助文件或驱动。
 
+AI 可执行安装（先克隆或下载本仓库，不需要 npm 账号）：
+
 ```powershell
-python -m pip install -r requirements.txt
+git clone https://github.com/chinayuren2022-2025/labview-native-mcp.git
+powershell -NoProfile -ExecutionPolicy Bypass -File ./labview-native-mcp/install.ps1
 ```
 
-必须使用实际 Python 安装路径；WindowsApps 的 python alias 可能不能工作。服务首次操作可通过 COM 启动 LabVIEW；用户会看到窗口。请将本仓库解压到可写目录，不要从 ZIP 内运行。
+`install.ps1` 自动查找真正的 Python 3.12 x64，检查 LabVIEW 安装，将发行输入安装到 `%LOCALAPPDATA%/LabVIEWNativeMCP`，创建专用 `.venv`，安装依赖，并建立真实 MCP 会话创建/保存一个原生 Add 节点。成功时打印 `INSTALL_PROBE_OK` 和生成的 `mcp-config.json`。此 JSON 是客户端配置片段，AI 应按客户端格式合并 `mcpServers.labview-native`，保留原有配置并备份；安装器不覆盖用户客户端配置。
+
+可传 `-Python C:/path/python.exe`、`-LabVIEWHome C:/path/LabVIEW`、`-InstallDir C:/path/install`。`-SkipProbe` 只跳过真实操作检查，不能据此宣称已验证。无需管理员权限，不修改系统 Python，不安装/启用 LabVIEW，不修改系统执行策略（Bypass 仅此次 PowerShell 进程）。依赖下载遵循本机 pip 源配置。首次探测可能启动 LabVIEW，产生临时 Probe.vi，但不会运行用户 VI 或连接硬件。
+
+必须使用实际 Python 安装路径；WindowsApps 的 python alias 被明确拒绝。LabVIEW/Python 缺失时退出并说明前置条件，不静默下载安装。服务工具缓存位于可写安装目录，安装器不复制旧 worker 缓存。
 
 默认 LabVIEW 路径为 `C:\Program Files\National Instruments\LabVIEW 2021`。其他路径用环境变量 `LABVIEW_HOME`；其他 LabVIEW 版本未验收。COM 注册也必须指向要使用的 LabVIEW 版本。
 
