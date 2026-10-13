@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+work/workers/
+work/mcp_render/
+work/crc_replica/
+work/lvs_render/
+*.log
