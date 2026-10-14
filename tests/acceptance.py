@@ -44,14 +44,14 @@ async def main():
 
         vi = await lv.call('new_vi', path=str(root / 'Polymorphic.vi'))
         poly = await lv.call('add_object', owner=vi['diagram'],
-                             path=str(LV / 'vi.lib/Bit Manipulation/Little-Endian Bytes To Words Poly.vi'))
-        assert (await lv.call('select_polymorphic', reference=poly, instance_index=2))['selected'] == 2
-        node = await lv.call('select_polymorphic', reference=poly, instance_index=4)
-        assert node['selected'] == 4
-        for member, terminal, name in [('Create Control', 'bytes in', 'bytes'), ('Create Indicator', 'words out', 'words')]:
+                             path=str(LV / 'vi.lib/Analysis/baseanly.llb/Mean.vi'))   # in 2018 and 2021
+        assert (await lv.call('select_polymorphic', reference=poly, instance_index=1))['selected'] == 1   # CDB
+        node = await lv.call('select_polymorphic', reference=poly, instance_index=0)                       # DBL
+        assert node['selected'] == 0
+        for member, terminal, name in [('Create Control', 'X', 'x'), ('Create Indicator', 'mean', 'mean')]:
             await label((await lv.invoke('Terminal', member, node['terminals'][terminal]))[member], name)
         await lv.call('save_vi', path=vi['path'])
-        assert (await lv.call('run_vi', path=vi['path'], inputs={'bytes': U8([1, 2, 3, 4])}, outputs=['words']))['words'] == [513, 1027]
+        assert (await lv.call('run_vi', path=vi['path'], inputs={'x': [1.0, 2.0, 3.0, 6.0]}, outputs=['mean']))['mean'] == 3.0
         express = await lv.call('configure_express_parameters', instance_path=str(express_path),
                                 configuration_path=str(LV / 'vi.lib/express/express input/SimulateSignalConfig.llb/Configure Simulate Signal.vi'),
                                 mappings={'Amplitude': 'Amplitude'}, values={'Amplitude': 2.5})

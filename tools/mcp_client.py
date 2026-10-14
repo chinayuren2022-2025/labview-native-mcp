@@ -1,6 +1,7 @@
 """Small stdio MCP client shared by the bundled tests and examples."""
 import base64
 import json
+import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -78,8 +79,11 @@ class LabVIEW:
 
 
 @asynccontextmanager
-async def connect():
-    server = StdioServerParameters(command=sys.executable, args=[str(SERVER)])
+async def connect(**overrides):
+    """Start the server. LABVIEW_HOME / LABVIEW_VERSION pass through unless overridden; None drops one."""
+    env = {k: os.environ[k] for k in ('LABVIEW_HOME', 'LABVIEW_VERSION') if k in os.environ}
+    env = {k: v for k, v in {**env, **overrides}.items() if v is not None}
+    server = StdioServerParameters(command=sys.executable, args=[str(SERVER)], env=env)
     async with stdio_client(server) as (reader, writer):
         async with ClientSession(reader, writer) as session:
             await session.initialize()

@@ -91,12 +91,12 @@ async def main():
         async def modes():
             target = await lv.call('new_vi', path=str(root / 'Modes.vi'))
             node = await lv.call('add_object', owner=target['diagram'],
-                                 path=str(LV / 'vi.lib/Bit Manipulation/Little-Endian Bytes To Words Poly.vi'))
-            old = await lv.call('select_polymorphic', reference=node, instance_index=2)
-            fresh = await lv.call('select_polymorphic', reference=node, instance_index=4)
-            await stale_is_source(old['terminals']['words out'])
+                                 path=str(LV / 'vi.lib/Analysis/baseanly.llb/Mean.vi'))   # in 2018 and 2021
+            old = await lv.call('select_polymorphic', reference=node, instance_index=1)
+            fresh = await lv.call('select_polymorphic', reference=node, instance_index=0)
+            await stale_is_source(old['terminals']['mean'])
             refs = []
-            for member, terminal, name in [('Create Control', 'bytes in', 'bytes'), ('Create Indicator', 'words out', 'words')]:
+            for member, terminal, name in [('Create Control', 'X', 'x'), ('Create Indicator', 'mean', 'mean')]:
                 refs.append((await lv.invoke('Terminal', member, fresh['terminals'][terminal]))[member])
                 await label(refs[-1], name)
             output = refs[1]
@@ -107,8 +107,8 @@ async def main():
             await lv.set('Control', 'Indicator', output, True)
             await lv.call('save_vi', path=target['path'])
             result = await lv.call('run_vi', path=target['path'],
-                                   inputs={'bytes': {'type': 'u8_array', 'value': [1, 2, 3, 4]}}, outputs=['words'])
-            assert result == {'words': [513, 1027]}, result
+                                   inputs={'x': [1.0, 2.0, 3.0, 6.0]}, outputs=['mean'])
+            assert result == {'mean': 3.0}, result
 
         async def broken():
             target = await lv.call('new_vi', path=str(root / 'Broken.vi'))

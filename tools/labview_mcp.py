@@ -66,6 +66,16 @@ def decode(value):
 
 
 @mcp.tool()
+async def version_info() -> dict:
+    """Report verified COM target version, architecture, installation and isolated cache.
+
+    Set LABVIEW_HOME or LABVIEW_VERSION before starting this server. Target mismatch
+    fails before any VI is loaded; one MCP server is bound to one LabVIEW instance.
+    """
+    return await native(lambda s: s.version_info)
+
+
+@mcp.tool()
 async def new_vi(path: str) -> dict:
     """Create an empty VI. Refuse existing paths; do not overwrite user work."""
     def create(s):
@@ -79,10 +89,12 @@ async def new_vi(path: str) -> dict:
 
 
 @mcp.tool()
-async def open_vi(path: str, show: bool = False) -> dict:
-    """Open an existing VI; optionally show its front panel and block diagram."""
+async def open_vi(path: str, show: bool = False, reload: bool = False) -> dict:
+    """Open a VI; reload=True discards unsaved edits and reads its saved file."""
     def open_(s):
         p = Path(path).resolve()
+        if reload:
+            s.revert(p)
         ref = s.vi(p)
         if show:
             s._invoke(ref, 'OpenFrontPanel', True)
@@ -183,7 +195,7 @@ async def add_shift_register(loop: int, y: int = 20) -> dict:
     read 'previous' inside the loop, feed 'next', and read 'final' after the loop.
     """
     def add(s):
-        # 'Y Positon' is LabVIEW 2021's own spelling of this parameter.
+        # 'Y Positon' is LabVIEW's own spelling of this parameter.
         right = s.method('Loop', 'Add Shift Register', loop, **{'Y Positon': y})['Add Shift Register']
         return _inspect(s, right)
     return await native(add)
