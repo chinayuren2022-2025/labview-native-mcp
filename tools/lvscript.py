@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import pythoncom
@@ -270,6 +271,10 @@ def _check(err, what):
 class Session:
     def __init__(self):
         global LV, WORKERS, BLANK
+        namespace = os.environ.get('LABVIEW_WORKER_NAMESPACE', '')
+        if namespace and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', namespace):
+            raise LabVIEWError('LABVIEW_WORKER_NAMESPACE must be 1-64 ASCII letters, digits, underscores or hyphens, starting with a letter or digit')
+        self._worker_events = []
         LV = _discover_labview()
         identity = _installation_identity(LV)
         if identity['major'] not in SUPPORTED:
@@ -278,9 +283,17 @@ class Session:
             # Both installations share a CLSID. Select the registry architecture
             # explicitly, then verify the actual server before loading any VI.
             activation = 0x80000 if identity['bitness'] == 64 else 0x40000
-            self.app = pythoncom.CoCreateInstance('{9A872070-0A06-11D1-90B7-00A024CE2744}', None,
-                                                 pythoncom.CLSCTX_LOCAL_SERVER | activation,
-                                                 pythoncom.IID_IDispatch)
+            for attempt in range(2):
+                try:
+                    self.app = pythoncom.CoCreateInstance('{9A872070-0A06-11D1-90B7-00A024CE2744}', None,
+                                                         pythoncom.CLSCTX_LOCAL_SERVER | activation,
+                                                         pythoncom.IID_IDispatch)
+                    break
+                except pythoncom.com_error as error:
+                    # CO_E_SERVEREXEC_FAILURE: a COM-launched LabVIEW released by the previous
+                    # client was still exiting. One more activation starts a fresh instance.
+                    if attempt or error.hresult & 0xFFFFFFFF != 0x80080005:
+                        raise
             actual_home = Path(self.app.Invoke(self.app.GetIDsOfNames('ApplicationDirectory'), 0,
                                               pythoncom.DISPATCH_PROPERTYGET, True)).resolve()
             actual_version = self.app.Invoke(self.app.GetIDsOfNames('Version'), 0,
@@ -291,10 +304,13 @@ class Session:
             raise LabVIEWError(f'LabVIEW COM target mismatch: requested {LV} ({identity["version"]}), '
                                f'connected {actual_home} ({actual_version}). No VI was loaded or edited. '
                                'Register the intended LabVIEW COM server for this architecture before retrying.')
-        tag = f'{identity["major"]}-{identity["bitness"]}-' + hashlib.sha256(f'{LV}|{ROOT}'.casefold().encode()).hexdigest()[:12]
+        cache_identity = f'{LV}|{ROOT}'.casefold()
+        if namespace:
+            cache_identity += f'|namespace={namespace}'
+        tag = f'{identity["major"]}-{identity["bitness"]}-' + hashlib.sha256(cache_identity.encode()).hexdigest()[:12]
         # Worker names carry the cache tag (LabVIEW home + this checkout), so VIs a LabVIEW session
         # still holds from an older cache version or another checkout never collide by name.
-        WORKERS = ROOT / 'work' / 'workers' / (tag + '-v14')
+        WORKERS = ROOT / 'work' / 'workers' / (tag + '-v15')
         BLANK = WORKERS / '_blank.vi'
         WORKERS.mkdir(parents=True, exist_ok=True)
         self._creator_paths = {}
@@ -309,7 +325,7 @@ class Session:
         self._alias = {}          # worker path -> {native label: English name}
         self._labels = {}         # worker path -> [(native label, English name)], workers never change
         self.version_info = {**identity, 'actual_version': actual_version,
-                             'cache': str(WORKERS)}
+                             'cache': str(WORKERS), 'worker_namespace': namespace}
         self._refs = {}           # path -> VI COM ref; holding them keeps edited VIs in memory
         self._workers = {}        # (kind, cls, member, write) -> (path, inputs, outputs)
         self._styles = None       # Python values only; never cached GObject refs
@@ -444,6 +460,22 @@ class Session:
         return path
 
     # ---- workers ------------------------------------------------------
+    @property
+    def worker_event_count(self):
+        """Monotonic count of workers actually generated in this session (not cache hits)."""
+        return len(self._worker_events)
+
+    def worker_events_since(self, index=0):
+        """Return successful generation events since a previously captured count.
+
+        Elapsed seconds include any nested generation; do not sum them as exclusive CPU time.
+        """
+        return [dict(event) for event in self._worker_events[index:]]
+
+    def _worker_created(self, kind, cls, member, path, started):
+        self._worker_events.append({'kind': kind, 'class': cls, 'member': member,
+                                    'path': str(path), 'elapsed': time.perf_counter() - started})
+
     def labels(self, vi_path):
         """English front-panel control labels of a worker, in panel order."""
         return [english for _, english in self._label_pairs(vi_path)]
@@ -473,10 +505,11 @@ class Session:
                 pass   # cluster elements and decorations
         return out
 
-    def _variant(self, base, wired, path, alias):
+    def _variant(self, base, wired, path, alias, cls, member):
         """Copy worker `base` to `path` keeping only the `wired` optional inputs connected."""
         self._alias[str(path.resolve())] = alias
         if not path.exists():
+            started = time.perf_counter()
             tmp = WORKERS / f'_tmp_{path.name}'
             self._refs.pop(str(tmp.resolve()), None)
             shutil.copyfile(base, tmp)
@@ -488,6 +521,7 @@ class Session:
                 self.method('VI', 'BD.Remove Bad Wires', self.vi(tmp))
             self.save(tmp, path)
             self._refs.pop(str(tmp.resolve()), None)
+            self._worker_created('variant', cls, member, path, started)
         return path, self.labels(path)
 
     def _native_styles(self):
@@ -541,6 +575,7 @@ class Session:
         tag = re.sub(r'[^A-Za-z0-9]+', '_', cls + '_' + '_'.join(sorted(wired)))
         path = WORKERS / f'{WORKERS.name}_function_New_VI_Object_native_{tag}.vi'
         if not path.exists():
+            started = time.perf_counter()
             tmp = WORKERS / f'_tmp_{path.name}'
             self._refs.pop(str(tmp.resolve()), None)
             shutil.copyfile(source, tmp)
@@ -575,6 +610,7 @@ class Session:
             self.method('VI', 'BD.Remove Bad Wires', self.vi(tmp))
             self.save(tmp, path)
             self._refs.pop(str(tmp.resolve()), None)
+            self._worker_created('object', cls, 'New VI Object', path, started)
         # Traversing the creator invalidates its earlier COM reference.
         self._cin = self.vi(source, fresh=True)
         self._workers[key] = path, styles
@@ -633,10 +669,11 @@ class Session:
         path = WORKERS / f'{WORKERS.name}_{safe}.vi'
         alias = self._member_names(member)
         if base is not None:
-            self._workers[key] = self._variant(base, wired, path, alias)
+            self._workers[key] = self._variant(base, wired, path, alias, cls, member)
             return self._workers[key]
         self._alias[str(path.resolve())] = alias
         if not path.exists():
+            started = time.perf_counter()
             tmp = WORKERS / f'_tmp_{path.name}'
             self.new_vi(tmp)
             self._member_node(self.diagram(tmp), kind, cls, member, write, (200, 120))
@@ -646,6 +683,7 @@ class Session:
             _check(out['error out'], 'wire all terminals')
             self.save(tmp, path)   # save-as: only a fully built worker ever appears under its real name
             self._refs.pop(str(tmp.resolve()), None)
+            self._worker_created(kind, cls, member, path, started)
         names = self.labels(path)
         self._workers[key] = path, names
         return self._workers[key]
@@ -692,6 +730,7 @@ class Session:
             return self._workers[path]
         self._alias[str(path.resolve())] = {n: e for _, _, m, _ in steps for n, e in self._member_names(m).items()}
         if not path.exists():
+            started = time.perf_counter()
             tmp = WORKERS / f'_tmp_{path.name}'
             self.new_vi(tmp)
             top = self.diagram(tmp)
@@ -713,6 +752,8 @@ class Session:
             _check(out['error out'], 'wire all terminals')
             self.save(tmp, path)
             self._refs.pop(str(tmp.resolve()), None)
+            self._worker_created('chain', ' -> '.join(c for _, c, _, _ in steps),
+                                 ' -> '.join(m for _, _, m, _ in steps), path, started)
         self._workers[path] = path, self.labels(path)
         return self._workers[path]
 
@@ -760,6 +801,74 @@ class Session:
     def method(self, cls, member, ref, **inputs):
         """Invoke scripting method `cls.member` on GObject ref; returns its outputs by name."""
         return self._member('method', cls, member, ref, False, inputs)
+
+    def prop_many(self, cls, member, refs):
+        """Read supported scalar properties in a native loop; raise on any per-item error."""
+        refs = list(refs)
+        if not refs:
+            return []
+        types = {('GObject', 'UID'): 'u32', ('GObject', 'Class Name'): 'string',
+                 ('GObject', 'Left'): 'i32', ('GObject', 'Top'): 'i32'}
+        if (cls, member) not in types:
+            raise LabVIEWError(f'prop_many does not support {cls}.{member}')
+        safe = re.sub(r'[^A-Za-z0-9]+', '_', f'bulk_{cls}_{member}')
+        path = WORKERS / f'{WORKERS.name}_{safe}.vi'
+        if not path.exists():
+            started = time.perf_counter()
+            tmp = WORKERS / f'_tmp_{path.name}'
+            self.new_vi(tmp)
+            top, panel = self.diagram(tmp), self.prop_get('VI', 'Panel', self.vi(tmp))
+            def label(control, name):
+                self.prop_set('Text', 'Text', self.prop_get('Control', 'Label', control), name)
+                return self.prop_get('Control', 'Terminal', control)
+            helper = self.new_object(top, path=LV / 'vi.lib' / 'Utility' / 'traverseref.llb' / 'Traverse for GObjects.vi', location=(20, 500))
+            helper_terms = self._terminals(helper)
+            def ref_array(name, indicator):
+                control = self.method('Terminal', 'Create Indicator', helper_terms['References'])['Create Indicator']
+                self.prop_set('Control', 'Indicator', control, indicator)
+                return label(control, name)
+            reference = ref_array('references', False)
+            def array(name, kind):
+                control = self.new_object(panel, style=21608, location=(700, 50))
+                if kind == 'error':
+                    element = self.new_object(control, style=21607, location=(0, 0))
+                    fields = [self.new_object(element, style=style, location=(0, i * 30))
+                              for i, style in enumerate((21001, 21003, 21701))]
+                    self.prop_set('Numeric', 'Rep', fields[1], 3)
+                    self.method('Cluster', 'Set Cluster Order', element, **{'Element Refs': fields})
+                else:
+                    style = {'u32': 21003, 'i32': 21003, 'string': 21701}[kind]
+                    element = self.new_object(control, style=style, location=(0, 0))
+                    if kind in ('u32', 'i32'):
+                        self.prop_set('Numeric', 'Rep', element, 7 if kind == 'u32' else 3)
+                self.prop_set('Control', 'Indicator', control, True)
+                return label(control, name)
+            values, errors = array('values', types[cls, member]), array('errors', 'error')
+            self.remove([helper])
+            # Outside terminals must exist before the loop; new terminals otherwise
+            # auto-place inside it, and repositioning does not change diagram ownership.
+            for terminal, location in ((reference, (20, 100)), (values, (800, 100)), (errors, (800, 250))):
+                self.prop_set('GObject', 'Position', terminal, location)
+            loop = self.new_object(top, style=2002, location=(200, 100), bounds=(450, 280))
+            self._member_node(self.prop_get('Loop', 'Diagram', loop), 'property', cls, member, False, (300, 180))
+            node = self.find(tmp, 'Property')[0]
+            native = self._member_names(member)
+            terminals = {WORKER_LABELS.get(n) or native.get(n, n): t for n, t in self._terminals(node).items()}
+            output = next(t for n, t in terminals.items() if n not in
+                          ('reference', 'reference out', 'error in (no error)', 'error out'))
+            for destination, source in ((terminals['reference'], reference), (values, output), (errors, terminals['error out'])):
+                self.method('Terminal', 'Connect Wire', destination, **{'Wire Source': source, 'Auto Route? (F)': True})
+            for tunnel in self.find(tmp, 'LoopTunnel'):
+                self.prop_set('LoopTunnel', 'IndexMode', tunnel, 1)
+            if self.prop_get('VI', 'Exec.State', self.vi(tmp)) != 1:
+                raise LabVIEWError(f'Bulk worker {cls}.{member} is not executable; inspect {tmp}')
+            self.save(tmp, path)
+            self._refs.pop(str(tmp.resolve()), None)
+            self._worker_created('bulk', cls, member, path, started)
+        result = self.run(path, {'references': refs}, ['values', 'errors'])
+        for index, error in enumerate(result['errors']):
+            _check(error, f'prop_many {cls}.{member} index {index} reference {refs[index]}')
+        return list(result['values'])
 
     def prop_get(self, cls, member, ref):
         out = self._member('property', cls, member, ref, False, {})

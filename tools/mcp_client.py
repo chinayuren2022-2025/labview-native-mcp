@@ -81,7 +81,7 @@ class LabVIEW:
 @asynccontextmanager
 async def connect(**overrides):
     """Start the server. LABVIEW_HOME / LABVIEW_VERSION pass through unless overridden; None drops one."""
-    env = {k: os.environ[k] for k in ('LABVIEW_HOME', 'LABVIEW_VERSION') if k in os.environ}
+    env = {k: os.environ[k] for k in ('LABVIEW_HOME', 'LABVIEW_VERSION', 'LABVIEW_WORKER_NAMESPACE', 'LABVIEW_CALL_LOG') if k in os.environ}
     env = {k: v for k, v in {**env, **overrides}.items() if v is not None}
     server = StdioServerParameters(command=sys.executable, args=[str(SERVER)], env=env)
     async with stdio_client(server) as (reader, writer):

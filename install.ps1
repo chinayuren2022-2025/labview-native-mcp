@@ -50,7 +50,11 @@ $LabVIEWVersion = [string]$selected.year
 $serverName = "labview-native-$LabVIEWVersion"
 $env:LABVIEW_HOME = $LabVIEWHome
 $env:LABVIEW_VERSION = $LabVIEWVersion
-if (-not $SkipProbe) { Invoke-Checked $runtime @((Join-Path $target 'tools\install_probe.py')) }
+# SkipProbe skips both COM-dependent steps, useful for offline packaging only.
+if (-not $SkipProbe) {
+  Invoke-Checked $runtime @((Join-Path $target 'tools\warmup.py'))
+  Invoke-Checked $runtime @((Join-Path $target 'tools\install_probe.py'))
+}
 $config = @{ mcpServers = @{ $serverName = @{
   command = $runtime.Replace('\','/')
   args = @((Join-Path $target 'tools\labview_mcp.py').Replace('\','/'))

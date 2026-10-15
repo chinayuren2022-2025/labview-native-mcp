@@ -65,6 +65,10 @@ python examples\signal_chain.py   # 正弦生成 → 增益/偏置 → 限幅 �
 | `wire` | 连接两个端子，跨结构时自动生成隧道 |
 | `get_property` / `set_property` / `invoke` | 调用任意原生属性和方法（例如 Formula 的 `FormExpr`、Build Array 扩展输入） |
 | `find_objects` | 按类名重新查找对象 |
+| `inspect_vi` | 一次返回对象/标签/位置/owner/常量值/控件值和端子连线；UID统一引用别名 |
+| `delete_objects` | 删除对象或导线；结构连同内容删除，不自动保存 |
+| `edit_batch` | 按顺序执行依赖编辑，用 `{"$ref":"步骤ID.字段.0"}` 引用前序结果；出错停止并报告部分结果，不回滚 |
+| `call_stats` | 当前服务的逐调用耗时、成功状态和实际worker生成记录 |
 | `clean_up_diagram` | 调用 LabVIEW 自带的整理框图 |
 | `connector` | 设置连接器图案并分配端子 |
 | `save_vi` / `run_vi` | 保存；同步运行并读取输出 |
@@ -74,6 +78,10 @@ python examples\signal_chain.py   # 正弦生成 → 增益/偏置 → 限幅 �
 推荐的调用顺序（服务器也会把它告诉 AI）：`search_styles` → `new_vi` → `add_object` → 配置 → `inspect_node` → `wire` → `clean_up_diagram` → `save_vi` → `run_vi` / `render_vi`。
 
 数据格式：普通 JSON 列表是数组；簇写成 `{"type": "cluster", "value": [...]}`；U8 数组写成 `{"type": "u8_array", "value": [1, 2, 255]}`（也支持 `u16` / `u32` / `i32` / `double`）。
+
+修改已有 VI：`open_vi` → `inspect_vi` 定位对象和实际连线 → `edit_batch` 合并有依赖的编辑 → `inspect_vi` 核对 → `save_vi` → `open_vi(reload=True)` 验收。不要靠 PNG 猜连线，连错了用 `delete_objects` 删。批处理不是事务，出错时看 `failed`，需要时 reload。
+
+每次调用的耗时记录在 `work/logs/mcp_<pid>.jsonl`（`LABVIEW_CALL_LOG` 可改位置，不记录输入值）。安装时会预生成常用 worker（`tools/warmup.py`）。`tests/modify_benchmark.py` 把一个模拟 3 通道 VI 改成 4 通道并自动验收：外部调用从 506 次降到 4 次，LabVIEW 内部执行时间基本不变。
 
 ## 已知限制
 

@@ -79,7 +79,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$src\install.ps1" -LabVIEWV
 
 1. 创建独立的 `.venv`，安装 `mcp` 和 `pywin32`。pip 走用户本机的源配置；国内网络慢时，可以先 `$env:PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"` 再运行。
 2. 找到指定版本的 LabVIEW，并核对它的实际版本号和位数。
-3. 启动 LabVIEW（首次大约 30–60 秒），建一个临时 VI 做真实测试。
+3. 启动所选LabVIEW，预生成高频编辑/结构检查worker（输出`WARMUP_OK`），再建临时VI执行真实探针。`-SkipProbe`同时跳过预热和探针，不得据此声称验收通过。预热失败按具体成员报告，不隐藏错误。
 4. 生成 `mcp-config.json`，里面是名为 `labview-native-2021`（或 `labview-native-2018`）的服务器条目，已经固定了版本，客户端启动时不会连错。
 
 **成功的标志是输出里有 `INSTALL_PROBE_OK`**，最后还会打印 `mcp-config.json` 的内容。没有出现这一行，就算安装失败，见第 5 步排障。

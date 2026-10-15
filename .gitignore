@@ -6,4 +6,7 @@ __pycache__/
 work/workers/
 work/mcp_render/
 work/*.vi
+work/logs/
+work/modify_benchmark_*/
+work/modify_speed_verification/
 examples/output/

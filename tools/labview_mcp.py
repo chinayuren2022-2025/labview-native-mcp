@@ -4,6 +4,12 @@ All COM calls run serially on one STA thread. Object references are only valid
 for the current LabVIEW session; rediscover them after delete, replace or revert.
 """
 import asyncio
+import contextvars
+import inspect
+import json
+import os
+import time
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import pythoncom
@@ -11,17 +17,53 @@ import win32com.client
 from mcp.server.fastmcp import FastMCP, Image
 from lvscript import Session, ROOT, cluster_array, LabVIEWError, format_com_error
 
-mcp = FastMCP('LabVIEW Native Scripting', instructions=(
+_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='labview-sta')
+_session = None
+_inline_session = contextvars.ContextVar('labview_inline_session', default=None)
+_call_trace = contextvars.ContextVar('labview_call_trace', default=None)
+_call_records = []
+
+
+def _record_call(record):
+    _call_records.append(record)
+    log = Path(os.environ.get('LABVIEW_CALL_LOG', str(ROOT / 'work' / 'logs' / f'mcp_{os.getpid()}.jsonl')))
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open('a', encoding='utf-8') as stream:
+        stream.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+
+class TimedMCP(FastMCP):
+    async def call_tool(self, name, arguments, *args, **kwargs):
+        start = time.perf_counter()
+        trace = {'workers': []}
+        token = _call_trace.set(trace)
+        ok = False
+        try:
+            result = await super().call_tool(name, arguments, *args, **kwargs)
+            ok = not trace.get('failed', False)
+            return result
+        finally:
+            _call_trace.reset(token)
+            _record_call({'time': datetime.now(timezone.utc).isoformat(), 'tool': name,
+                          'elapsed': time.perf_counter() - start, 'ok': ok,
+                          'workers': trace['workers']})
+
+
+mcp = TimedMCP('LabVIEW Native Scripting', instructions=(
     'Build VIs in this order: search_styles -> new_vi/open_vi -> add_object -> configure '
     '(set_property/invoke) -> inspect_node for fresh terminals -> wire -> clean_up_diagram -> '
     'save_vi -> run_vi/render_vi. Terminals change when a node is reconfigured, so inspect again. '
+    'To modify an existing VI: open_vi -> inspect_vi once -> edit_batch with named dependent '
+    'steps -> inspect_vi to verify topology -> clean_up_diagram -> save_vi -> open_vi(reload=True). '
+    'Use delete_objects to remove nodes or wires. Batches stop on failure without rollback or autosave. '
     'Use absolute paths. run_vi executes the VI for real, including any hardware or network I/O.'))
-_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='labview-sta')
-_session = None
 
 
-def _dispatch(operation, args):
+
+
+def _dispatch(operation, args, trace):
     global _session
+    start = _session.worker_event_count if _session is not None else 0
     try:
         if _session is None:
             pythoncom.CoInitialize()
@@ -29,10 +71,17 @@ def _dispatch(operation, args):
         return encode(operation(_session, *args))
     except pythoncom.com_error as exc:
         raise LabVIEWError(format_com_error(exc, operation.__name__)) from None
+    finally:
+        if trace is not None and _session is not None:
+            trace['workers'].extend(_session.worker_events_since(start))
 
 
 async def native(operation, *args):
-    return await asyncio.get_running_loop().run_in_executor(_executor, _dispatch, operation, args)
+    current = _inline_session.get()
+    if current is not None:
+        return encode(operation(current, *args))
+    context = contextvars.copy_context()
+    return await asyncio.get_running_loop().run_in_executor(_executor, context.run, _dispatch, operation, args, _call_trace.get())
 
 
 def encode(value):
@@ -130,6 +179,103 @@ async def add_object(owner: int, style: str | int | None = None, location: list[
 async def find_objects(path: str, object_class: str, panel: bool = False) -> list[int]:
     """Rediscover objects, especially after mode changes, replacement or revert."""
     return await native(lambda s: s.find(path, object_class, target=0 if panel else 1))
+
+@mcp.tool()
+async def inspect_vi(path: str) -> dict:
+    """Read objects, labels, values, nesting, terminals and actual wire endpoints in one call.
+
+    Snapshot references are session-local; refresh after reconfiguration or reload.
+    Unsupported object facets are reported explicitly, never inferred from a PNG.
+    """
+    from vi_snapshot import snapshot
+    return await native(lambda s: snapshot(s, str(Path(path).resolve()), _inspect))
+
+
+@mcp.tool()
+async def delete_objects(references: list[int], clean_wires: bool = True) -> dict:
+    """Delete explicit node/control/wire references; edits are not saved automatically.
+
+    Deleting a structure deletes its contents. Rediscover references afterward.
+    """
+    def remove(s):
+        for reference in references:
+            if not reference:
+                raise ValueError('Cannot delete a null object reference')
+            s.prop_get('GObject', 'Class Name', reference)
+        owners = []
+        if clean_wires and s.version_info['major'] == 18:
+            for reference in references:
+                worker, names = s.chain_worker([('property', 'GObject', 'Owning VI', False),
+                                                ('property', 'VI', 'Path', False)])
+                output = next(n for n in names if n.lower() == 'path')
+                owners.append(s.run(worker, {'reference': reference}, [output])[output])
+        removed = s.remove(list(dict.fromkeys(references)), clean_wires)
+        for owner in dict.fromkeys(owners):
+            s.method('VI', 'BD.Remove Bad Wires', s.vi(owner))
+        return {'removed': removed}
+    return await native(remove)
+
+
+@mcp.tool()
+async def call_stats() -> dict:
+    """Return per-tool timing and actual generated workers; no argument values logged."""
+    return {'calls': list(_call_records)}
+
+
+def _batch_value(value, results):
+    if isinstance(value, dict) and set(value) == {'$ref'}:
+        parts = value['$ref'].split('.')
+        resolved = results[parts[0]]
+        for part in parts[1:]:
+            resolved = resolved[int(part)] if isinstance(resolved, (list, tuple)) else resolved[part]
+        return resolved
+    if isinstance(value, dict):
+        return {k: _batch_value(v, results) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_batch_value(v, results) for v in value]
+    return value
+
+
+@mcp.tool()
+async def edit_batch(steps: list[dict]) -> dict:
+    """Execute dependent steps in one STA dispatch. Steps: {id,tool,args}.
+
+    Args may contain {"$ref":"earlier_id.field.0"}. Stops on first error and returns
+    completed results plus failed step. No rollback, implicit save/run or nested batch.
+    """
+    allowed = {'new_vi', 'open_vi', 'add_object', 'inspect_node', 'inspect_vi',
+               'get_property', 'set_property', 'invoke', 'wire', 'delete_objects',
+               'find_objects', 'clean_up_diagram', 'save_vi', 'add_shift_register'}
+    ids = set()
+    for step in steps:
+        if not isinstance(step.get('id'), str) or not step['id'] or '.' in step['id'] or step['id'] in ids:
+            raise ValueError('Batch step IDs must be unique non-empty strings without dots')
+        ids.add(step['id'])
+        if step.get('tool') not in allowed:
+            raise ValueError(f'Unsupported batch tool: {step.get("tool")}')
+        inspect.signature(globals()[step['tool']]).bind(**step.get('args', {}))
+
+    def execute(s):
+        async def run():
+            token = _inline_session.set(s)
+            results = {}
+            try:
+                for step in steps:
+                    try:
+                        args = _batch_value(step.get('args', {}), results)
+                        results[step['id']] = await globals()[step['tool']](**args)
+                    except Exception as exc:
+                        trace = _call_trace.get()
+                        if trace is not None:
+                            trace['failed'] = True
+                        return {'results': results, 'completed': list(results),
+                                'failed': step['id'], 'error': str(exc), 'saved_implicitly': False}
+                return {'results': results, 'completed': list(results), 'failed': None}
+            finally:
+                _inline_session.reset(token)
+        return asyncio.run(run())
+    return await native(execute)
+
 
 
 def _tunnel_roles(s, ref, cls):
